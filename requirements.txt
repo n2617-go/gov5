@@ -1,4 +1,3 @@
-flask
 yfinance
 FinMind
 pandas
