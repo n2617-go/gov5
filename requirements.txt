@@ -2,3 +2,5 @@ flask
 yfinance
 FinMind
 pandas
+tqdm
+requests
