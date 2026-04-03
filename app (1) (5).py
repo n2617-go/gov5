@@ -3,111 +3,88 @@ import yfinance as yf
 import pandas as pd
 import time
 import random
-from datetime import datetime, time as dt_time
-from FinMind.data import DataLoader
+from datetime import datetime
 
-# --- 頁面配置 ---
-st.set_page_config(page_title="台股智慧監測", layout="centered")
-
-# 自定義 CSS (紅漲綠跌)
-st.markdown("""
-    <style>
-    [data-testid="stMetricDelta"] svg { display: none; }
-    [data-testid="stMetricValue"] { font-size: 2.2rem !important; }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- 核心邏輯判斷 ---
-def is_market_open():
-    """判斷目前是否為台股開盤時間 (週一至週五 09:00-13:35)"""
-    now = datetime.now()
-    # 週六(5)與週日(6)不開盤
-    if now.weekday() >= 5:
-        return False
+def fetch_with_retry(stock_id, name):
+    """
+    自動判斷 .TW 或 .TWO，並處理收盤後的 NaN 幽靈列問題
+    """
+    suffixes = [".TW", ".TWO"]
     
-    current_time = now.time()
-    start_time = dt_time(9, 0)
-    end_time = dt_time(13, 35)
-    return start_time <= current_time <= end_time
-
-# --- 數據抓取引擎 ---
-dl = DataLoader()
-
-@st.cache_data(ttl=60 if is_market_open() else 3600)
-def get_stock_data(stock_id, yf_ticker, name):
-    """根據時間自動切換引擎"""
-    market_status = is_market_open()
-    
-    # --- 盤中：優先使用 FinMind (即時性高) ---
-    if market_status:
+    for suffix in suffixes:
+        ticker_str = f"{stock_id}{suffix}"
         try:
-            end_date = datetime.now().strftime('%Y-%m-%d')
-            start_date = (datetime.now() - pd.Timedelta(days=7)).strftime('%Y-%m-%d')
-            df_fm = dl.taiwan_stock_price(stock_id=stock_id, start_date=start_date, end_date=end_date)
+            # 1. 隨機延遲，避免被 Yahoo 封鎖
+            time.sleep(random.uniform(1.0, 2.0))
             
-            if not df_fm.empty and len(df_fm) >= 2:
-                curr = float(df_fm.iloc[-1]['close'])
-                prev = float(df_fm.iloc[-2]['close'])
-                return {"price": curr, "change": curr - prev, "pct": (curr - prev)/prev*100, "src": "FinMind (即時)"}
-        except:
-            pass # 失敗則往下走 yfinance 備援
+            # 2. 抓取資料 (用 download 比 Ticker().history 穩定)
+            df = yf.download(ticker_str, period="10d", progress=False)
+            
+            if df.empty:
+                continue # 嘗試下一個後綴
+                
+            # 3. 處理 yfinance 新版 MultiIndex 欄位 (扁平化)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            
+            # 4. 【關鍵】剔除收盤後可能產生的空值行 (NaN)
+            df_clean = df.dropna(subset=['Close'])
+            
+            if len(df_clean) < 2:
+                continue # 資料不足，試下一個
+                
+            # 5. 成功取得資料，進行計算
+            latest_row = df_clean.iloc[-1]
+            prev_row = df_clean.iloc[-2]
+            
+            curr_price = float(latest_row['Close'])
+            prev_price = float(prev_row['Close'])
+            
+            # 檢查是否真的抓到數字 (避免 0 或 nan)
+            if curr_price == 0 or pd.isna(curr_price):
+                continue
 
-    # --- 盤後/備援：使用 yfinance (含延遲機制) ---
-    try:
-        # 加入隨機延遲 1~3 秒，避免封鎖
-        time.sleep(random.uniform(1.0, 3.0))
-        
-        tk = yf.Ticker(yf_ticker)
-        df = tk.history(period="7d")
-        
-        if not df.empty and len(df) >= 2:
-            curr = df.iloc[-1]['Close']
-            prev = df.iloc[-2]['Close']
+            change = curr_price - prev_price
+            pct = (change / prev_price) * 100
+            
             return {
-                "price": curr, 
-                "change": curr - prev, 
-                "pct": (curr - prev)/prev*100, 
-                "src": "yfinance (盤後/備援)"
+                "id": stock_id,
+                "name": name,
+                "price": curr_price,
+                "change": change,
+                "pct": pct,
+                "src": f"yfinance ({suffix})",
+                "date": df_clean.index[-1].strftime('%m/%d')
             }
-    except:
-        return None
+        except Exception:
+            continue # 發生任何錯誤就試下一個後綴
+            
+    return None # 全部試完都失敗才回傳 None
 
-# --- UI 介面 ---
-st.title("📈 台股智慧雙引擎監測")
+# --- UI 顯示部分 ---
+st.title("📈 台股自動辨識監測")
 
-status_text = "🟢 盤中即時模式 (FinMind)" if is_market_open() else "🌙 盤後靜態模式 (yfinance)"
-st.info(f"目前狀態：{status_text}")
-
-# 股票清單
 STOCK_LIST = [
-    {"id": "2330", "name": "台積電", "yf": "2330.TW"},
-    {"id": "00631L", "name": "元大台灣50正2", "yf": "00631L.TW"},
-    {"id": "00981A", "name": "主動統一台股增長", "yf": "00981A.TW"}
+    {"id": "2330", "name": "台積電"},
+    {"id": "00631L", "name": "元大台灣50正2"},
+    {"id": "00981A", "name": "主動統一台股增長"}
 ]
 
-# 顯示卡片
 for stock in STOCK_LIST:
-    data = get_stock_data(stock["id"], stock["yf"], stock["name"])
+    data = fetch_with_retry(stock["id"], stock["name"])
     
     with st.container(border=True):
         if data:
             col1, col2 = st.columns([3, 2])
             with col1:
-                st.subheader(f"{stock['name']}")
-                st.caption(f"代號: {stock['id']} | 數據來源: {data['src']}")
+                st.subheader(data["name"])
+                st.caption(f"代碼: {data['id']} | 來源: {data['src']}")
             with col2:
                 st.metric(
-                    label="目前股價", 
+                    label=f"現價 ({data['date']})", 
                     value=f"{data['price']:.2f}", 
                     delta=f"{data['change']:+.2f} ({data['pct']:+.2f}%)",
                     delta_color="inverse"
                 )
         else:
-            st.error(f"無法讀取 {stock['name']} ({stock['id']})")
-
-if st.button("🔄 手動刷新資料"):
-    st.cache_data.clear()
-    st.rerun()
-
-st.divider()
-st.caption(f"系統最後檢查: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            st.error(f"❌ 無法取得 {stock['name']} ({stock['id']})，請檢查代碼或稍後再試")
